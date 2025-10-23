@@ -1,0 +1,524 @@
+//+------------------------------------------------------------------+
+//| RM9 - RSI+MAs EA | Confluência RSI (zona ou cruzo) + EMA 9/21  |
+//| Sem sessões; timeframe = current                                 |
+//+------------------------------------------------------------------+
+#property copyright "v9"
+#property version   "1.0.9"
+#property strict
+
+#include <Trade/Trade.mqh>
+
+//============================= INPUTS ===============================
+input double   LoteMinimo                 = 0.01;
+input int      StopLossPontos             = 200;      // 0 = sem SL
+input int      TakeProfitPontos           = 400;      // 0 = sem TP
+input long     MagicNumber                = 52001;    // Magic number for the EA
+
+// Trailing & BE
+input int      TrailingStopGanho          = 300;      // trailing do lucro (pts)
+input int      TrailingStopPerda          = 200;      // trailing da perda (pts)
+input int      AtivarTrailingPerdaApos    = 150;      // ativa trailing de PERDA após X pts contra
+input bool     UsarBreakEvenEmergencia    = true;
+input int      BreakEvenBufferPontos      = 20;       // deslocamento acima do preço de entrada
+
+// RSI
+input int      PeriodoRSI                 = 14;
+input double   RSI_Buy_Level              = 55.0;     // zona: compra se RSI>=Buy
+input double   RSI_Sell_Level             = 45.0;     // zona: venda se RSI<=Sell
+input bool     RSI_Buy_CrossUp            = true;     // se true, exige CROSS-UP da zona de compra
+input bool     RSI_Sell_CrossDown         = true;     // se true, exige CROSS-DOWN da zona de venda
+input ENUM_APPLIED_PRICE  RSI_Price       = PRICE_CLOSE;
+input bool     ConfirmarBarraFechada      = true;     // true: sinais somente em candle fechado
+
+// Médias móveis
+input int      MA_Fast_Period             = 9;
+input int      MA_Slow_Period             = 21;
+input ENUM_MA_METHOD     MA_Method        = MODE_EMA;
+input ENUM_APPLIED_PRICE MA_AppliedPrice  = PRICE_CLOSE;
+input int      CruzRecentBars             = 3;        // janela (em barras) em que o cruzo deve ter ocorrido
+input int      DistMinPontos              = 10;       // histérese mínima pós-cruzo
+
+// Segurança / filtros operacionais
+input bool     UmaOrdemPorVez             = true;     // só 1 posição por símbolo/magic
+input int      DebounceSec                = 2;        // trava repetição de sinal
+input int      CooldownReopenSec          = 45;       // arrefecimento entre fechar e reabrir
+input int      SpreadMaxPontos            = 100;      // bloqueio por spread
+
+// Logs e painel
+input bool     SalvarLogsArquivo          = true;
+input string   NomeArquivoLog             = "EA_RSI_logs.csv";
+input bool     MarcarEntradasNoGrafico    = true;
+input bool     MostrarPainel              = true;
+
+//========================== VARIÁVEIS ===============================
+CTrade trade;
+
+int    rsiHandle = INVALID_HANDLE;
+int    maFast    = INVALID_HANDLE;
+int    maSlow    = INVALID_HANDLE;
+
+bool   isHedge   = false;
+
+datetime lastSignalTime   = 0;
+datetime lastCloseTime    = 0;
+
+ulong   totalEntries=0, totalExits=0;
+double  grossProfitSum=0.0, grossLossSum=0.0;
+
+//=========================== UTILITÁRIOS ============================
+double Pt()   { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
+double Pip()  { return Pt() * ((int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)>3 ? 10.0 : 1.0); }
+
+string TFToStr()
+{
+   return EnumToString(_Period);
+}
+
+void Log(const string msg)
+{
+   Print(msg);
+   if(!SalvarLogsArquivo) return;
+
+   int h = FileOpen(NomeArquivoLog,
+                    FILE_WRITE|FILE_READ|FILE_CSV|FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_TXT,
+                    ';');
+   if(h!=INVALID_HANDLE)
+   {
+      string when = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+      FileSeek(h, 0, SEEK_END);
+      FileWrite(h, when, _Symbol, TFToStr(), msg);
+      FileClose(h);
+   }
+}
+
+bool SpreadOK()
+{
+   double ask = 0, bid = 0;
+   if(!SymbolInfoDouble(_Symbol, SYMBOL_ASK, ask) ||
+      !SymbolInfoDouble(_Symbol, SYMBOL_BID, bid)) return false;
+   double spr = (ask-bid)/Pt();
+   return (spr <= SpreadMaxPontos);
+}
+
+bool CooldownOK()
+{
+   if(lastCloseTime==0) return true;
+   return (TimeCurrent() - lastCloseTime >= CooldownReopenSec);
+}
+
+bool DebounceOK()
+{
+   if(lastSignalTime==0) return true;
+   return (TimeCurrent() - lastSignalTime >= DebounceSec);
+}
+
+//=========================== GRÁFICO / PAINEL =======================
+#define PANEL_PREFIX "RM9P_"
+
+void PanelDeleteAll()
+{
+   int total = ObjectsTotal(0,0,-1);
+   for(int i=total-1;i>=0;--i)
+   {
+      string n = ObjectName(0,i,0,-1);
+      if(StringFind(n,PANEL_PREFIX,0)==0)
+         ObjectDelete(0,n);
+   }
+}
+
+void PanelLabel(const string id, const string text, int y, color clr, int fsize)
+{
+   string name = PANEL_PREFIX + id;
+   int    win  = 0;
+
+   if(!ObjectFind(0,name))
+   {
+      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,name,OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0,name,OBJPROP_XDISTANCE, 10);
+   }
+   ObjectSetInteger(0,name,OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0,name,OBJPROP_COLOR, clr);
+   ObjectSetInteger(0,name,OBJPROP_FONTSIZE, fsize);
+   ObjectSetString(0,name,OBJPROP_TEXT, text);
+}
+
+void UpdatePanel()
+{
+   if(!MostrarPainel) { PanelDeleteAll(); return; }
+
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double spr = (ask-bid)/Pt();
+
+   PanelLabel("TITLE","RM9  |  "+_Symbol+"  "+EnumToString(_Period),8, clrAqua, 12);
+   PanelLabel("BAL",  StringFormat("Bal: %.2f  Eq: %.2f  Spr: %.1f", bal, eq, spr), 28, clrSilver, 9);
+
+   string mode = (AccountInfoInteger(ACCOUNT_MARGIN_MODE)==ACCOUNT_MARGIN_MODE_RETAIL_HEDGING ? "HEDGE" : "NETTING");
+   PanelLabel("MAG",  "Magic="+IntegerToString((long)MagicNumber)+"  Mode="+mode, 44, clrSilver, 9);
+
+   PanelLabel("RULE", StringFormat("EMA %d/%d (%s)  |  RSI(%d) Buy>=%.1f Sell<=%.1f  crossUp=%s crossDn=%s",
+                        MA_Fast_Period,MA_Slow_Period,EnumToString(MA_Method),
+                        PeriodoRSI,RSI_Buy_Level,RSI_Sell_Level,
+                        (RSI_Buy_CrossUp?"ON":"off"),(RSI_Sell_CrossDown?"ON":"off")), 64, clrWhite, 9);
+
+   PanelLabel("SAFE", StringFormat("SL=%d TP=%d TS+=%d TS-=%d/%d  BE=%s(%d)  SpreadMax=%d",
+                        StopLossPontos,TakeProfitPontos,TrailingStopGanho,
+                        TrailingStopPerda,AtivarTrailingPerdaApos,
+                        (UsarBreakEvenEmergencia?"ON":"off"),
+                        BreakEvenBufferPontos, SpreadMaxPontos), 80, clrWhite, 9);
+
+   PanelLabel("CTRL", StringFormat("Debounce=%ds  Cooldown=%ds  1pos=%s",
+                        DebounceSec,CooldownReopenSec,(UmaOrdemPorVez?"ON":"off")), 96, clrWhite, 9);
+
+   PanelLabel("STATS",StringFormat("Entradas=%llu  Saidas=%llu  GProfit=%.2f  GLoss=%.2f",
+                        totalEntries,totalExits,grossProfitSum,grossLossSum), 112, clrYellow, 9);
+}
+
+//========================== INDICADORES =============================
+bool CreateIndicators()
+{
+   if(rsiHandle!=INVALID_HANDLE) IndicatorRelease(rsiHandle);
+   if(maFast!=INVALID_HANDLE)    IndicatorRelease(maFast);
+   if(maSlow!=INVALID_HANDLE)    IndicatorRelease(maSlow);
+
+   rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, PeriodoRSI, RSI_Price);
+   maFast    = iMA (_Symbol, PERIOD_CURRENT, MA_Fast_Period, 0, MA_Method, MA_AppliedPrice);
+   maSlow    = iMA (_Symbol, PERIOD_CURRENT, MA_Slow_Period, 0, MA_Method, MA_AppliedPrice);
+
+   if(rsiHandle==INVALID_HANDLE || maFast==INVALID_HANDLE || maSlow==INVALID_HANDLE)
+   {
+      Log("[INIT] Falha ao criar indicadores");
+      return false;
+   }
+   return true;
+}
+
+bool GetRSI(double &rsi_cur, double &rsi_prev)
+{
+   double buf[3];
+   int need = ConfirmarBarraFechada ? 2 : 1;
+   int copied = CopyBuffer(rsiHandle,0,0,need+1,buf);
+   if(copied < need+1) return false;
+
+   if(ConfirmarBarraFechada) // usa barra 1 como atual válido
+   {
+      rsi_cur  = buf[1];
+      rsi_prev = buf[2];
+   }
+   else
+   {
+      rsi_cur  = buf[0];
+      rsi_prev = buf[1];
+   }
+   return true;
+}
+
+bool GetMAs(double &fast0,double &slow0,double &fast1,double &slow1)
+{
+   double f[4], s[4];
+   int need = MathMax(CruzRecentBars+1,3);
+   int copiedF = CopyBuffer(maFast,0,0,need,f);
+   int copiedS = CopyBuffer(maSlow,0,need,s);
+   if(copiedF<3 || copiedS<3) return false;
+
+   if(ConfirmarBarraFechada)
+   {
+      fast0 = f[1]; slow0 = s[1];
+      fast1 = f[2]; slow1 = s[2];
+   }
+   else
+   {
+      fast0 = f[0]; slow0 = s[0];
+      fast1 = f[1]; slow1 = s[1];
+   }
+   return true;
+}
+
+// Detecta se houve cruzamento das MAs na janela recente
+bool MA_CrossUpRecent()
+{
+   // Fast cruza de baixo p/ cima da Slow
+   int look = MathMax(CruzRecentBars,1);
+   for(int i=1;i<=look;i++)
+   {
+      double f0 = iMA(_Symbol,PERIOD_CURRENT,MA_Fast_Period,0,MA_Method,MA_AppliedPrice,i);
+      double s0 = iMA(_Symbol,PERIOD_CURRENT,MA_Slow_Period,0,MA_Method,MA_AppliedPrice,i);
+      double f1 = iMA(_Symbol,PERIOD_CURRENT,MA_Fast_Period,0,MA_Method,MA_AppliedPrice,i+1);
+      double s1 = iMA(_Symbol,PERIOD_CURRENT,MA_Slow_Period,0,MA_Method,MA_AppliedPrice,i+1);
+      if(f1<=s1 && f0>s0)
+      {
+         // histérese mínima em pontos
+         double price = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+         if(MathAbs((f0-s0)/Pt()) >= DistMinPontos) return true;
+      }
+   }
+   return false;
+}
+
+bool MA_CrossDownRecent()
+{
+   int look = MathMax(CruzRecentBars,1);
+   for(int i=1;i<=look;i++)
+   {
+      double f0 = iMA(_Symbol,PERIOD_CURRENT,MA_Fast_Period,0,MA_Method,MA_AppliedPrice,i);
+      double s0 = iMA(_Symbol,PERIOD_CURRENT,MA_Slow_Period,0,MA_Method,MA_AppliedPrice,i);
+      double f1 = iMA(_Symbol,PERIOD_CURRENT,MA_Fast_Period,0,MA_Method,MA_AppliedPrice,i+1);
+      double s1 = iMA(_Symbol,PERIOD_CURRENT,MA_Slow_Period,0,MA_Method,MA_AppliedPrice,i+1);
+      if(f1>=s1 && f0<s0)
+      {
+         if(MathAbs((f0-s0)/Pt()) >= DistMinPontos) return true;
+      }
+   }
+   return false;
+}
+
+//========================= POSIÇÕES/ORDENS ==========================
+bool HasOpenPosition(int &pos_dir, double &pos_price, ulong &ticket)
+{
+   pos_dir   = 0;
+   pos_price = 0.0;
+   ticket    = 0;
+
+   if(isHedge)
+   {
+      int total = PositionsTotal();
+      for(int i=0;i<total;i++)
+      {
+         ulong t = PositionGetTicket(i);
+         if(!PositionSelectByTicket(t)) continue;
+         if(PositionGetString(POSITION_SYMBOL)==_Symbol &&
+            PositionGetInteger(POSITION_MAGIC)==MagicNumber)
+         {
+            long type = PositionGetInteger(POSITION_TYPE);
+            pos_dir   = (type==POSITION_TYPE_BUY ? 1 : -1);
+            pos_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            ticket    = t;
+            return true;
+         }
+      }
+      return false;
+   }
+   else
+   {
+      if(!PositionSelect(_Symbol)) return false;
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber) return false;
+      long type = PositionGetInteger(POSITION_TYPE);
+      pos_dir   = (type==POSITION_TYPE_BUY ? 1 : -1);
+      pos_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      ticket    = PositionGetInteger(POSITION_TICKET);
+      return true;
+   }
+}
+
+void DrawArrow(bool buy, const string tag)
+{
+   if(!MarcarEntradasNoGrafico) return;
+   string n = "RM9_"+tag+"_"+IntegerToString((int)TimeCurrent());
+   int type = (buy ? DRAW_ARROW : DRAW_ARROW);
+   double price = (buy ? SymbolInfoDouble(_Symbol,SYMBOL_BID) : SymbolInfoDouble(_Symbol,SYMBOL_ASK));
+   ObjectCreate(0,n,OBJ_ARROW,0,TimeCurrent(),price);
+   ObjectSetInteger(0,n,OBJPROP_COLOR, (buy?clrLime:clrTomato));
+   ObjectSetInteger(0,n,OBJPROP_ARROWCODE, (buy?233:234));
+}
+
+void CloseAllForSymbol()
+{
+   int dir; double price; ulong tk;
+   while(HasOpenPosition(dir,price,tk))
+   {
+      trade.PositionClose(tk);
+      totalExits++;
+      lastCloseTime = TimeCurrent();
+      Sleep(50);
+   }
+}
+
+bool OpenBuy()
+{
+   double sl=0,tp=0;
+   if(StopLossPontos>0)  sl = SymbolInfoDouble(_Symbol,SYMBOL_BID) - StopLossPontos*Pt();
+   if(TakeProfitPontos>0)tp = SymbolInfoDouble(_Symbol,SYMBOL_BID) + TakeProfitPontos*Pt();
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   bool ok = trade.Buy(LoteMinimo,_Symbol,0.0,sl,tp,"RM9 BUY");
+   if(ok){ totalEntries++; DrawArrow(true,"BUY"); Log("[ENTRADA] BUY"); }
+   return ok;
+}
+
+bool OpenSell()
+{
+   double sl=0,tp=0;
+   if(StopLossPontos>0)  sl = SymbolInfoDouble(_Symbol,SYMBOL_ASK) + StopLossPontos*Pt();
+   if(TakeProfitPontos>0)tp = SymbolInfoDouble(_Symbol,SYMBOL_ASK) - TakeProfitPontos*Pt();
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   bool ok = trade.Sell(LoteMinimo,_Symbol,0.0,sl,tp,"RM9 SELL");
+   if(ok){ totalEntries++; DrawArrow(false,"SELL"); Log("[ENTRADA] SELL"); }
+   return ok;
+}
+
+void TrailAndBE()
+{
+   int dir; double openPrice; ulong tk;
+   if(!HasOpenPosition(dir,openPrice,tk)) return;
+
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   // Break-even emergencial
+   if(UsarBreakEvenEmergencia)
+   {
+      double be = openPrice + (dir>0 ? 1 : -1)*BreakEvenBufferPontos*Pt();
+      double sl = PositionGetDouble(POSITION_SL);
+      if(dir>0 && bid > be && (sl==0.0 || sl < be))
+         trade.PositionModify(tk, be, PositionGetDouble(POSITION_TP));
+      if(dir<0 && ask < be && (sl==0.0 || sl > be))
+         trade.PositionModify(tk, be, PositionGetDouble(POSITION_TP));
+   }
+
+   // Trailing do lucro
+   if(TrailingStopGanho>0)
+   {
+      double newSL=0;
+      if(dir>0) // buy
+      {
+         double trigger = openPrice + TrailingStopGanho*Pt();
+         if(bid>trigger)
+         {
+            newSL = bid - TrailingStopGanho*Pt();
+            if(newSL > PositionGetDouble(POSITION_SL))
+               trade.PositionModify(tk,newSL,PositionGetDouble(POSITION_TP));
+         }
+      }
+      else // sell
+      {
+         double trigger = openPrice - TrailingStopGanho*Pt();
+         if(ask<trigger)
+         {
+            newSL = ask + TrailingStopGanho*Pt();
+            if(newSL < PositionGetDouble(POSITION_SL) || PositionGetDouble(POSITION_SL)==0.0)
+               trade.PositionModify(tk,newSL,PositionGetDouble(POSITION_TP));
+         }
+      }
+   }
+
+   // Trailing da perda (após X pts contra)
+   if(TrailingStopPerda>0 && AtivarTrailingPerdaApos>0)
+   {
+      double newSL=0;
+      if(dir>0) // buy
+      {
+         double contra = openPrice - AtivarTrailingPerdaApos*Pt();
+         if(bid<contra)
+         {
+            newSL = bid + TrailingStopPerda*Pt();
+            trade.PositionModify(tk,newSL,PositionGetDouble(POSITION_TP));
+         }
+      }
+      else // sell
+      {
+         double contra = openPrice + AtivarTrailingPerdaApos*Pt();
+         if(ask>contra)
+         {
+            newSL = ask - TrailingStopPerda*Pt();
+            trade.PositionModify(tk,newSL,PositionGetDouble(POSITION_TP));
+         }
+      }
+   }
+}
+
+//============================== SINAIS ===============================
+bool SignalBUY()
+{
+   double r, rp;
+   if(!GetRSI(r,rp)) return false;
+
+   bool rsiOK = (RSI_Buy_CrossUp ? (rp<RSI_Buy_Level && r>=RSI_Buy_Level)
+                                 : (r>=RSI_Buy_Level));
+
+   bool maOK  = MA_CrossUpRecent();
+
+   return (rsiOK && maOK);
+}
+
+bool SignalSELL()
+{
+   double r, rp;
+   if(!GetRSI(r,rp)) return false;
+
+   bool rsiOK = (RSI_Sell_CrossDown ? (rp>RSI_Sell_Level && r<=RSI_Sell_Level)
+                                    : (r<=RSI_Sell_Level));
+
+   bool maOK  = MA_CrossDownRecent();
+
+   return (rsiOK && maOK);
+}
+
+//=============================== INIT ================================
+int OnInit()
+{
+   Log(StringFormat("[PARAM] RSI(%d) Buy>=%.1f (Up=%s)  Sell<=%.1f (Dn=%s) | MAs %d/%d %s | TS+%d TS-%d | SL=%d TP=%d",
+       PeriodoRSI,RSI_Buy_Level,(RSI_Buy_CrossUp?"Y":"N"),RSI_Sell_Level,(RSI_Sell_CrossDown?"Y":"N"),
+       MA_Fast_Period,MA_Slow_Period,EnumToString(MA_Method),TrailingStopGanho,TrailingStopPerda,StopLossPontos,TakeProfitPontos));
+
+   isHedge = (AccountInfoInteger(ACCOUNT_MARGIN_MODE)==ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+
+   if(!CreateIndicators()) return(INIT_FAILED);
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   Log(StringFormat("[READY] EA pronto (%s) | Magic=%s", (isHedge?"HEDGE":"NETTING"), IntegerToString((long)MagicNumber)));
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   PanelDeleteAll();
+   if(rsiHandle!=INVALID_HANDLE) IndicatorRelease(rsiHandle);
+   if(maFast!=INVALID_HANDLE)    IndicatorRelease(maFast);
+   if(maSlow!=INVALID_HANDLE)    IndicatorRelease(maSlow);
+}
+
+//================================ TICK ===============================
+void OnTick()
+{
+   UpdatePanel();
+   TrailAndBE();
+
+   // bloqueios rápidos
+   if(!SpreadOK())           return;
+   if(!DebounceOK())         return;
+   if(!CooldownOK())         return;
+
+   // Uma ordem por vez por símbolo/magic
+   int dir; double price; ulong tk;
+   bool hasPos = HasOpenPosition(dir,price,tk);
+
+   // Sinais
+   bool buySig  = SignalBUY();
+   bool sellSig = SignalSELL();
+
+   if(!buySig && !sellSig) return;
+
+   // A partir daqui consideramos o disparo (marca o debounce)
+   lastSignalTime = TimeCurrent();
+
+   if(UmaOrdemPorVez && hasPos)
+   {
+      // Se sinal contrário, fecha e tenta abrir na direção nova
+      if( (dir>0 && sellSig) || (dir<0 && buySig) )
+      {
+         CloseAllForSymbol();
+         // respeita cooldown — o próximo tick vai checar CooldownOK
+         return;
+      }
+      // se já tem posição na mesma direção, não faz nada
+      return;
+   }
+
+   // Abrir
+   if(buySig)  OpenBuy();
+   if(sellSig) OpenSell();
+}
