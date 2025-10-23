@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                                    MA_RSI_EA.mq5 |
+//|                                                    EMA_RSI_EA.mq5 |
 //|                        Criado por [Seu Nome]                    |
 //|             Estratégia de cruzamento de MAs + RSI para fechamento |
 //+------------------------------------------------------------------+
@@ -12,7 +12,7 @@ input double LoteMinimo            = 0.1;  // Tamanho do lote para operação
 input int StopLossPontos           = 200;  // Stop loss em pontos
 input int TakeProfitPontos         = 400;  // Take profit em pontos
 input int TrailingStopGanho        = 300;  // Trailing stop de lucro (em pontos)
-input int TrailingStopPerda        = 150;  // Trailing stop de perda (em pontos)
+input int TrailingStopPerda        = 200;  // Trailing stop de perda (em pontos)
 input int BreakEvenBufferPontos    = 20;   // Buffer de Break Even (em pontos)
 input int SpreadMaxPontos          = 50;   // Spread máximo permitido
 
@@ -27,7 +27,7 @@ input bool UsarTrailingStop        = true;  // Ativar trailing stop
 input bool UsarBreakEven          = true;  // Ativar break even
 
 input bool SalvarLogsArquivo      = true;  // Salvar logs em arquivo .csv
-input string NomeArquivoLog       = "MA_RSI_EA_Logs.csv"; // Nome do arquivo de logs
+input string NomeArquivoLog       = "EMA_RSI_EA_Logs.csv"; // Nome do arquivo de logs
 
 input bool MarcarEntradasNoGrafico = true; // Marcar entradas no gráfico
 input bool MostrarPainel           = true; // Mostrar painel de informações
@@ -207,7 +207,7 @@ int OnInit() {
 //================================ TICK ===============================
 void OnTick() {
    if (!SpreadOK()) return;
-   if (!DebounceOK()) return;
+   if (!DebounceOK()) return();
 
    int dir; double price; ulong tk;
    bool hasPos = HasOpenPosition(dir, price, tk);
