@@ -411,12 +411,20 @@ void OnTick()
    // Uma ordem por vez por símbolo/magic
    int dir; double price; ulong tk;
    bool hasPos = HasOpenPosition(dir,price,tk);
+if(hasPos && ShouldCloseByRSI(dir)) {
+  CloseAllForSymbol();
+  return;
+}
 
    // Sinais de compra e venda
    bool buySig  = SignalBUY();
    bool sellSig = SignalSELL();
 
    if(!buySig && !sellSig) return;
+if(hasPos && ShouldCloseByRSI(dir)) {
+  CloseAllForSymbol();
+  return;
+}
 
    // A partir daqui consideramos o disparo (marca o debounce)
    lastSignalTime = TimeCurrent();
