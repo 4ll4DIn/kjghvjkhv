@@ -339,21 +339,14 @@ bool OpenSell()
    if(StopLossPontos>0)  sl = SymbolInfoDouble(_Symbol,SYMBOL_ASK) + StopLossPontos*Pt();
    if(TakeProfitPontos>0)tp = SymbolInfoDouble(_Symbol,SYMBOL_ASK) - TakeProfitPontos*Pt();
 
-   trade.SetExpertMagicNumber(MagicNumber);
-   bool ok = trade.Sell(LoteMinimo,_Symbol,0.0,sl,tp,"RM9 SELL");
-   if(ok){ totalEntries++; DrawArrow(false,"SELL"); Log("[ENTRADA] SELL"); }
-   return ok;
+  bool ShouldCloseByRSI(int dir) {
+  double rsi, prev;
+  if(!GetRSI(rsi, prev)) return false;
+  if(dir > 0 && rsi >= 70) return true; // fechar compra
+  if(dir < 0 && rsi <= 30) return true; // fechar venda
+  return false;
 }
 
-void TrailAndBE()
-{
-   int dir; double openPrice; ulong tk;
-   if(!HasOpenPosition(dir,openPrice,tk)) return;
-
-   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-
-   // Break-even emergencial
    if(UsarBreakEvenEmergencia)
    {
       double be = openPrice + (dir>0 ? 1 : -1)*BreakEvenBufferPontos*Pt();
@@ -363,26 +356,14 @@ void TrailAndBE()
       if(dir<0 && ask < be && (sl==0.0 || sl > be))
          trade.PositionModify(tk, be, PositionGetDouble(POSITION_TP));
    }
+bool SignalBUY() {
+  return MA_CrossUpRecent(); // ✅ Apenas cruzamento de médias
+}
 
-   // Trailing do lucro
-   if(TrailingStopGanho>0)
-   {
-      double newSL=0;
-      if(dir>0) // buy
-      {
-         double trigger = openPrice + TrailingStopGanho*Pt();
-         if(bid>trigger)
-         {
-            newSL = bid - TrailingStopGanho*Pt();
-            if(newSL > PositionGetDouble(POSITION_SL))
-               trade.PositionModify(tk,newSL,PositionGetDouble(POSITION_TP));
-         }
-      }
-      else // sell
-      {
-         double trigger = openPrice - TrailingStopGanho*Pt();
-         if(ask<trigger)
-         {
+bool SignalSELL() {
+  return MA_CrossDownRecent(); // ✅ Apenas cruzamento de médias
+}
+
             newSL = ask + TrailingStopGanho*Pt();
             if(newSL < PositionGetDouble(POSITION_SL) || PositionGetDouble(POSITION_SL)==0.0)
                trade.PositionModify(tk,newSL,PositionGetDouble(POSITION_TP));
