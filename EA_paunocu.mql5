@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                               RM9 - EMA + RSI EA |
-//|                          Estratégia de Compra/Venda              |
-//|                       Baseado nas EMAs e RSI para saída         |
+//|                     Estratégia de Cruzamento de EMAs              |
+//|                     Fechamento de Posições com RSI              |
 //+------------------------------------------------------------------+
 #property copyright "v9"
 #property version   "1.0.9"
